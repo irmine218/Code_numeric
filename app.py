@@ -1,5 +1,6 @@
 import json
 import time
+import re
 import streamlit as st
 from google import genai
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -57,19 +58,23 @@ def rechercher(requete, k=4):
 
 
 def demander_au_modele(consigne, essais=4):
+    st.session_state["derniere_erreur"] = ""
     for modele in MODELES:
         for essai in range(essais):
             try:
                 reponse = client.models.generate_content(model=modele, contents=consigne)
-                return reponse.text
+                if reponse.text:
+                    return reponse.text
+                st.session_state["derniere_erreur"] = "Le modèle a renvoyé une réponse vide."
+                return None
             except Exception as e:
+                st.session_state["derniere_erreur"] = str(e)[:300]
                 print("ERREUR GEMINI :", str(e)[:500])
                 if "503" in str(e) or "429" in str(e):
                     time.sleep(5 * (2 ** essai))
                 else:
                     raise
     return None
-
 
 def repondre(question, messages):
     questions_precedentes = [m["content"] for m in messages if m["role"] == "user"]
@@ -94,7 +99,12 @@ def repondre(question, messages):
                  "Voici les articles les plus pertinents :")
     return texte, trouves
 
-
+def mettre_en_forme(texte):
+    texte = re.sub(r"\s*([▪•])\s*", r"\n\n\1 ", texte)
+    texte = re.sub(r"\s(\d{1,2})-\s", r"\n\n\1- ", texte)
+    texte = re.sub(r"\s-\s(?=[A-ZÀ-Ý])", "\n\n- ", texte)
+    return texte
+    
 def afficher(message):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
@@ -102,7 +112,7 @@ def afficher(message):
             with st.expander("Voir les articles consultés"):
                 for a in message["sources"]:
                     st.markdown(f"**Article {a['numero']}**")
-                    st.write(a["texte"][:1500])
+                    st.markdown(mettre_en_forme(a["texte"]))
 
 
 with st.sidebar:
@@ -139,3 +149,5 @@ if question:
         reponse_msg = {"role": "assistant", "content": reponse, "sources": sources}
         st.session_state.messages.append(reponse_msg)
         afficher(reponse_msg)
+if st.session_state.get("derniere_erreur"):
+    st.sidebar.caption("Détail technique (temporaire) : " + st.session_state["derniere_erreur"])
