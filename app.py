@@ -1,10 +1,32 @@
 import json
-import re
+import time
 import streamlit as st
+from google import genai
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-st.set_page_config(page_title="Code du numérique du Bénin", page_icon="⚖️")
+st.set_page_config(page_title="Assistant Code du numérique du Bénin")
+
+MODELES = ["gemini-3.8-flash"]
+SEUIL = 0.05
+MAX_QUESTIONS = 20
+
+CONSIGNE = """Tu es un assistant qui informe sur le Code du numérique du Bénin (loi n° 2017-20).
+Règles :
+- Réponds UNIQUEMENT à partir des extraits d'articles fournis ci-dessous.
+- Cite le numéro de chaque article utilisé, sous la forme (Article X).
+- Si les extraits ne permettent pas de répondre, dis-le clairement et ne devine pas.
+- Réponds en français, de façon simple et courte.
+- Tu informes : tu ne donnes pas de conseil juridique personnalisé.
+
+CONVERSATION JUSQU'ICI :
+{historique}
+
+EXTRAITS :
+{extraits}
+
+QUESTION : {question}
+"""
 
 
 @st.cache_resource
@@ -18,45 +40,101 @@ def charger_moteur():
     return articles, vectoriseur, matrice
 
 
+@st.cache_resource
+def charger_client():
+    return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+
+
 articles, vectoriseur, matrice = charger_moteur()
+client = charger_client()
 
 
-def rechercher(question, k, seuil):
-    vecteur = vectoriseur.transform([question])
+def rechercher(requete, k=4):
+    vecteur = vectoriseur.transform([requete])
     scores = cosine_similarity(vecteur, matrice)[0]
     meilleurs = scores.argsort()[::-1][:k]
-    return [(articles[i], scores[i]) for i in meilleurs if scores[i] >= seuil]
+    return [articles[i] for i in meilleurs if scores[i] >= SEUIL]
 
 
-st.title("Moteur de recherche du Code du numérique du Bénin")
-st.caption("Loi n° 2017-20, version votée par l'Assemblée nationale. "
-           "Information générale, pas un conseil juridique.")
+def demander_au_modele(consigne, essais=4):
+    for modele in MODELES:
+        for essai in range(essais):
+            try:
+                reponse = client.models.generate_content(model=modele, contents=consigne)
+                return reponse.text
+            except Exception as e:
+                if "503" in str(e) or "429" in str(e):
+                    time.sleep(5 * (2 ** essai))
+                else:
+                    raise
+    return None
+
+
+def repondre(question, messages):
+    questions_precedentes = [m["content"] for m in messages if m["role"] == "user"]
+    requete = question
+    if len(question.split()) < 6 and questions_precedentes:
+        requete = questions_precedentes[-1] + " " + question
+
+    trouves = rechercher(requete)
+    if not trouves:
+        return "Je n'ai trouvé aucun article du Code qui corresponde à cette question.", []
+
+    historique = "\n".join(
+        ("Utilisateur : " if m["role"] == "user" else "Assistant : ") + m["content"]
+        for m in messages[-6:]
+    ) or "(début de la conversation)"
+    extraits = "\n\n".join(a["texte"][:1500] for a in trouves)
+
+    texte = demander_au_modele(
+        CONSIGNE.format(historique=historique, extraits=extraits, question=question))
+    if texte is None:
+        texte = ("L'assistant IA est momentanément indisponible. "
+                 "Voici les articles les plus pertinents :")
+    return texte, trouves
+
+
+def afficher(message):
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        if message.get("sources"):
+            with st.expander("Voir les articles consultés"):
+                for a in message["sources"]:
+                    st.markdown(f"**Article {a['numero']}**")
+                    st.write(a["texte"][:1500])
+
 
 with st.sidebar:
-    st.header("Réglages")
-    k = st.slider("Nombre d'articles à afficher", 1, 10, 3)
-    seuil = st.slider("Seuil de pertinence", 0.0, 0.3, 0.05, 0.01)
+    st.header("À propos")
+    st.write("Assistant d'information sur le Code du numérique du Bénin "
+             "(loi n° 2017-20, version votée par l'Assemblée nationale). "
+             "Il répond à partir des articles du Code. "
+             "Information générale, pas un conseil juridique.")
+    if st.button("Nouvelle conversation"):
+        st.session_state.messages = []
+        st.rerun()
 
-question = st.text_input("Posez votre question, ou tapez un numéro d'article (exemple : article 45)")
+st.title("Assistant du Code du numérique du Bénin")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for m in st.session_state.messages:
+    afficher(m)
+
+question = st.chat_input("Posez votre question sur le Code du numérique...")
 
 if question:
-    correspondance = re.fullmatch(r"\s*(?:article\s*)?(\d+)\s*", question, flags=re.IGNORECASE)
-
-    if correspondance:
-        numero = int(correspondance.group(1))
-        trouves = [a for a in articles if a["numero"] == numero]
-        if trouves:
-            st.subheader(f"Article {numero}")
-            st.write(trouves[0]["texte"])
-        else:
-            st.warning("Cet article n'a pas été retrouvé dans le texte utilisé.")
+    nb_questions = sum(1 for m in st.session_state.messages if m["role"] == "user")
+    if nb_questions >= MAX_QUESTIONS:
+        st.warning("Limite de questions atteinte pour cette conversation. "
+                   "Cliquez sur « Nouvelle conversation » pour continuer.")
     else:
-        resultats = rechercher(question, k, seuil)
-        if not resultats:
-            st.info("Aucun article du Code ne correspond à cette question.")
-        else:
-            st.write(f"{len(resultats)} article(s) trouvé(s) :")
-            for position, (article, score) in enumerate(resultats):
-                titre = f"Article {article['numero']} (pertinence : {score:.2f})"
-                with st.expander(titre, expanded=(position == 0)):
-                    st.write(article["texte"])
+        precedents = list(st.session_state.messages)
+        st.session_state.messages.append({"role": "user", "content": question})
+        afficher(st.session_state.messages[-1])
+        with st.spinner("Recherche dans le Code..."):
+            reponse, sources = repondre(question, precedents)
+        reponse_msg = {"role": "assistant", "content": reponse, "sources": sources}
+        st.session_state.messages.append(reponse_msg)
+        afficher(reponse_msg)
