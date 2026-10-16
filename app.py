@@ -63,6 +63,7 @@ def demander_au_modele(consigne, essais=4):
                 reponse = client.models.generate_content(model=modele, contents=consigne)
                 return reponse.text
             except Exception as e:
+                print("ERREUR GEMINI :", str(e)[:500])
                 if "503" in str(e) or "429" in str(e):
                     time.sleep(5 * (2 ** essai))
                 else:
